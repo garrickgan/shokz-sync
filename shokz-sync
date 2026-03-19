@@ -1,0 +1,497 @@
+#!/bin/bash
+# shokz-sync - Download music from multiple sources and sync to Shokz OpenSwim Pro
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/shokz-sync"
+CONFIG_FILE="$CONFIG_DIR/config"
+SOURCES_FILE="$CONFIG_DIR/sources.conf"
+LOCAL_DIR="$HOME/Music/ShokzLibrary"
+ARCHIVE_FILE="$LOCAL_DIR/.yt-dlp-archive"
+PODCAST_ARCHIVE="$LOCAL_DIR/.podcast-archive"
+LOG_DIR="$HOME/.local/share/shokz-sync"
+LOG_FILE="$LOG_DIR/sync.log"
+
+# Defaults (overridden by config file)
+DEVICE_LABEL="SWIM PRO"
+BROWSER="chrome"
+MAX_DEVICE_TRACKS=20
+MAX_DOWNLOADS_PER_SOURCE=50
+RESERVE_MB=200
+
+# Load user config
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+MOUNT_POINT="/run/media/$USER/$DEVICE_LABEL"
+
+mkdir -p "$LOCAL_DIR" "$LOG_DIR" "$CONFIG_DIR"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+notify() {
+    notify-send -i audio-headphones "Shokz Sync" "$1" 2>/dev/null || true
+}
+
+# Download from a yt-dlp compatible source (soundcloud, youtube, mixcloud)
+download_ytdlp_source() {
+    local url="$1"
+    local label="$2"
+    local extra_args=("${@:3}")
+
+    log "[$label] Downloading new tracks..."
+
+    yt-dlp \
+        --cookies-from-browser "$BROWSER" \
+        --extract-audio \
+        --audio-format mp3 \
+        --audio-quality 0 \
+        --download-archive "$ARCHIVE_FILE" \
+        --output "$LOCAL_DIR/%(title)s.%(ext)s" \
+        --no-overwrites \
+        --restrict-filenames \
+        --replace-in-metadata title '[/\\]' '_' \
+        --max-downloads "$MAX_DOWNLOADS_PER_SOURCE" \
+        "${extra_args[@]}" \
+        "$url" 2>&1 | tee -a "$LOG_FILE" || true
+}
+
+# Download from a podcast RSS feed
+download_podcast() {
+    local url="$1"
+    local label="$2"
+
+    log "[$label] Checking for new episodes..."
+    touch "$PODCAST_ARCHIVE"
+
+    # Fetch and parse RSS feed for enclosure URLs
+    local episodes
+    episodes=$(python3 -c "
+import xml.etree.ElementTree as ET
+import sys, urllib.request
+
+try:
+    req = urllib.request.Request(sys.argv[1], headers={'User-Agent': 'Mozilla/5.0'})
+    data = urllib.request.urlopen(req, timeout=30).read()
+    root = ET.fromstring(data)
+    count = 0
+    for item in root.iter('item'):
+        enc = item.find('enclosure')
+        if enc is not None and 'audio' in enc.get('type', ''):
+            title = item.findtext('title', 'untitled').replace('/', '_').replace('\\\\', '_')
+            url = enc.get('url', '')
+            if url:
+                print(f'{url}\t{title}')
+                count += 1
+                if count >= 10:
+                    break
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+" "$url" 2>&1) || true
+
+    if [ -z "$episodes" ]; then
+        log "[$label] No episodes found or feed unavailable."
+        return
+    fi
+
+    local downloaded=0
+    while IFS=$'\t' read -r ep_url ep_title; do
+        # Skip if already downloaded
+        if grep -qF "$ep_url" "$PODCAST_ARCHIVE" 2>/dev/null; then
+            continue
+        fi
+
+        # Sanitize filename
+        local safe_title
+        safe_title=$(echo "$ep_title" | tr -cd '[:alnum:] _.-' | tr ' ' '_' | head -c 200)
+        local outfile="$LOCAL_DIR/${safe_title}.mp3"
+
+        if [ -f "$outfile" ]; then
+            echo "$ep_url" >> "$PODCAST_ARCHIVE"
+            continue
+        fi
+
+        log "[$label] Downloading: $ep_title"
+
+        # Download and convert to mp3 if needed
+        local tmpfile
+        tmpfile=$(mktemp "$LOCAL_DIR/.tmp_podcast_XXXXX")
+
+        if curl -sL --max-time 600 -o "$tmpfile" "$ep_url"; then
+            # Check if it's already mp3 or needs conversion
+            local mimetype
+            mimetype=$(file --mime-type -b "$tmpfile")
+            if [[ "$mimetype" == "audio/mpeg" ]]; then
+                mv "$tmpfile" "$outfile"
+            else
+                ffmpeg -y -loglevel error -i "$tmpfile" -acodec libmp3lame -q:a 0 "$outfile" 2>&1 | tee -a "$LOG_FILE" || true
+                rm -f "$tmpfile"
+            fi
+
+            if [ -f "$outfile" ]; then
+                echo "$ep_url" >> "$PODCAST_ARCHIVE"
+                downloaded=$((downloaded + 1))
+                log "[$label] Downloaded: $safe_title"
+            fi
+        else
+            log "[$label] Failed to download: $ep_title"
+            rm -f "$tmpfile"
+        fi
+
+        if [ "$downloaded" -ge 5 ]; then
+            log "[$label] Hit per-source episode limit (5)."
+            break
+        fi
+    done <<< "$episodes"
+
+    log "[$label] Downloaded $downloaded new episode(s)."
+}
+
+# Download from all configured sources
+download_all() {
+    if [ ! -f "$SOURCES_FILE" ]; then
+        log "No sources file found at $SOURCES_FILE"
+        echo "Run 'shokz-sync add' to add sources, or create $SOURCES_FILE"
+        return 1
+    fi
+
+    local count_before
+    count_before=$(find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' | wc -l)
+
+    while IFS='|' read -r stype url label; do
+        # Skip comments and empty lines
+        [[ "$stype" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$stype" ]] && continue
+
+        # Trim whitespace
+        stype=$(echo "$stype" | xargs)
+        url=$(echo "$url" | xargs)
+        label=$(echo "$label" | xargs)
+
+        case "$stype" in
+            soundcloud)
+                download_ytdlp_source "$url" "$label"
+                ;;
+            youtube)
+                download_ytdlp_source "$url" "$label" --no-playlist-reverse
+                ;;
+            mixcloud)
+                download_ytdlp_source "$url" "$label"
+                ;;
+            podcast)
+                download_podcast "$url" "$label"
+                ;;
+            *)
+                log "Unknown source type: $stype"
+                ;;
+        esac
+    done < "$SOURCES_FILE"
+
+    local count_after
+    count_after=$(find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' | wc -l)
+    local new_count=$((count_after - count_before))
+    log "Total: downloaded $new_count new track(s). Library: $count_after"
+}
+
+# Import podcast subscriptions from OPML file
+import_opml() {
+    local opml_file="$1"
+
+    if [ ! -f "$opml_file" ]; then
+        echo "OPML file not found: $opml_file"
+        return 1
+    fi
+
+    log "Importing podcasts from OPML: $opml_file"
+
+    local feeds
+    feeds=$(python3 -c "
+import xml.etree.ElementTree as ET, sys
+tree = ET.parse(sys.argv[1])
+for outline in tree.iter('outline'):
+    url = outline.get('xmlUrl', '')
+    title = outline.get('text', outline.get('title', 'Unknown Podcast'))
+    if url:
+        print(f'{url}\t{title}')
+" "$opml_file")
+
+    local added=0
+    while IFS=$'\t' read -r feed_url feed_title; do
+        if grep -qF "$feed_url" "$SOURCES_FILE" 2>/dev/null; then
+            echo "  Already exists: $feed_title"
+            continue
+        fi
+        echo "podcast|$feed_url|$feed_title" >> "$SOURCES_FILE"
+        echo "  Added: $feed_title"
+        added=$((added + 1))
+    done <<< "$feeds"
+
+    echo ""
+    echo "Imported $added podcast(s). Edit $SOURCES_FILE to enable/disable."
+}
+
+# Add a new source
+add_source() {
+    local stype="$1"
+    local url="$2"
+    local label="${3:-$stype}"
+
+    case "$stype" in
+        soundcloud|youtube|mixcloud|podcast)
+            echo "$stype|$url|$label" >> "$SOURCES_FILE"
+            echo "Added $stype source: $label"
+            echo "  URL: $url"
+            ;;
+        *)
+            echo "Unknown type: $stype"
+            echo "Supported: soundcloud, youtube, mixcloud, podcast"
+            return 1
+            ;;
+    esac
+}
+
+# List configured sources
+list_sources() {
+    if [ ! -f "$SOURCES_FILE" ]; then
+        echo "No sources configured."
+        echo "Run 'shokz-sync add <type> <url> <label>' to get started."
+        return
+    fi
+
+    echo "=== Configured Sources ==="
+    while IFS='|' read -r stype url label; do
+        [[ -z "$stype" ]] && continue
+        [[ -z "$label" ]] && continue
+        if [[ "$stype" =~ ^[[:space:]]*# ]]; then
+            stype=$(echo "$stype" | sed 's/^[[:space:]]*#[[:space:]]*//')
+            [[ "$stype" =~ ^(soundcloud|youtube|mixcloud|podcast)$ ]] || continue
+            echo "  [disabled] $stype: $label"
+        else
+            echo "  [enabled]  $stype: $label"
+        fi
+    done < "$SOURCES_FILE"
+    echo ""
+    echo "Config: $SOURCES_FILE"
+}
+
+get_device_free_mb() {
+    df --output=avail -BM "$MOUNT_POINT" | tail -1 | tr -d ' M'
+}
+
+get_file_size_mb() {
+    du -BM "$1" | cut -f1 | tr -d 'M'
+}
+
+get_device_tracks_oldest_first() {
+    find "$MOUNT_POINT" -maxdepth 1 -name '*.mp3' -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-
+}
+
+get_local_tracks_newest_first() {
+    find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+}
+
+sync_to_device() {
+    if [ ! -d "$MOUNT_POINT" ]; then
+        log "Shokz not mounted at $MOUNT_POINT"
+        return 1
+    fi
+
+    log "Syncing to Shokz OpenSwim Pro (max $MAX_DEVICE_TRACKS tracks)..."
+
+    # Determine the target set: newest N local tracks
+    local target_files=()
+    local target_basenames=()
+    while IFS= read -r local_track; do
+        if [ ${#target_files[@]} -ge "$MAX_DEVICE_TRACKS" ]; then
+            break
+        fi
+        target_files+=("$local_track")
+        target_basenames+=("$(basename "$local_track")")
+    done < <(get_local_tracks_newest_first)
+
+    # Remove tracks from device that aren't in the target set
+    local removed=0
+    while IFS= read -r device_track; do
+        local dname
+        dname=$(basename "$device_track")
+        local keep=false
+        for tname in "${target_basenames[@]}"; do
+            if [ "$dname" = "$tname" ]; then
+                keep=true
+                break
+            fi
+        done
+        if [ "$keep" = false ]; then
+            log "  Removing (not in top $MAX_DEVICE_TRACKS): $dname"
+            rm -f "$device_track"
+            removed=$((removed + 1))
+        fi
+    done < <(get_device_tracks_oldest_first)
+
+    if [ "$removed" -gt 0 ]; then
+        sync
+        log "Removed $removed old track(s) from device."
+    fi
+
+    # Copy new tracks that aren't on the device yet
+    local to_sync=()
+    for track in "${target_files[@]}"; do
+        local bname
+        bname=$(basename "$track")
+        if [ ! -f "$MOUNT_POINT/$bname" ]; then
+            to_sync+=("$track")
+        fi
+    done
+
+    if [ ${#to_sync[@]} -eq 0 ]; then
+        log "No new tracks to sync."
+        notify "Already up to date!"
+        return 0
+    fi
+
+    log "${#to_sync[@]} new track(s) to sync"
+
+    local synced=0
+    for track in "${to_sync[@]}"; do
+        local bname
+        bname=$(basename "$track")
+        local size
+        size=$(get_file_size_mb "$track")
+
+        local free_mb
+        free_mb=$(get_device_free_mb)
+        if [ "$free_mb" -lt $((size + RESERVE_MB)) ]; then
+            log "Not enough space for $bname (${size}MB). Stopping."
+            break
+        fi
+
+        log "  Copying: $bname (${size}MB)"
+        cp "$track" "$MOUNT_POINT/$bname"
+        synced=$((synced + 1))
+    done
+
+    sync
+    log "Synced $synced new track(s) to Shokz."
+    notify "Synced $synced new track(s)!"
+}
+
+status() {
+    echo "=== shokz-sync ==="
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "Config: $CONFIG_FILE"
+    else
+        echo "Config: (defaults)"
+    fi
+    echo "Device label: $DEVICE_LABEL"
+    echo "Browser: $BROWSER"
+    echo "Max device tracks: $MAX_DEVICE_TRACKS"
+    echo ""
+
+    echo "=== Music Library ==="
+    local local_count
+    local_count=$(find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' | wc -l)
+    local local_size
+    local_size=$(du -sh "$LOCAL_DIR" 2>/dev/null | cut -f1)
+    echo "Tracks: $local_count ($local_size)"
+    echo "Location: $LOCAL_DIR"
+
+    echo ""
+    list_sources
+
+    echo ""
+    echo "=== Shokz OpenSwim Pro ==="
+    if [ -d "$MOUNT_POINT" ]; then
+        local device_count
+        device_count=$(find "$MOUNT_POINT" -maxdepth 1 -name '*.mp3' | wc -l)
+        local device_used
+        device_used=$(du -sh "$MOUNT_POINT" --exclude='SYSTEM' --exclude='System Volume Information' 2>/dev/null | cut -f1)
+        local device_free
+        device_free=$(get_device_free_mb)
+        echo "Tracks: $device_count ($device_used used, ${device_free}MB free)"
+        echo ""
+        echo "On device:"
+        get_device_tracks_oldest_first | while IFS= read -r f; do
+            basename "$f"
+        done
+    else
+        echo "Not connected (looking for /run/media/$USER/$DEVICE_LABEL)"
+    fi
+
+    echo ""
+    echo "=== Pending Sync (newest $MAX_DEVICE_TRACKS) ==="
+    local pending=0
+    local shown=0
+    while IFS= read -r local_track; do
+        if [ "$shown" -ge "$MAX_DEVICE_TRACKS" ]; then
+            break
+        fi
+        local bname
+        bname=$(basename "$local_track")
+        shown=$((shown + 1))
+        if [ -d "$MOUNT_POINT" ] && [ -f "$MOUNT_POINT/$bname" ]; then
+            echo "  = $bname (on device)"
+        else
+            echo "  + $bname"
+            pending=$((pending + 1))
+        fi
+    done < <(get_local_tracks_newest_first)
+    echo "Total: $pending track(s) waiting to sync"
+}
+
+case "${1:-}" in
+    download)
+        download_all
+        ;;
+    sync)
+        sync_to_device
+        ;;
+    auto)
+        notify "Syncing music from all sources..."
+        download_all
+        sync_to_device
+        ;;
+    status)
+        status
+        ;;
+    sources)
+        list_sources
+        ;;
+    add)
+        if [ $# -lt 3 ]; then
+            echo "Usage: shokz-sync add <type> <url> [label]"
+            echo "Types: soundcloud, youtube, mixcloud, podcast"
+            echo ""
+            echo "Examples:"
+            echo "  shokz-sync add youtube 'https://www.youtube.com/playlist?list=PLxxx' 'My Music'"
+            echo "  shokz-sync add podcast 'https://feeds.example.com/feed.xml' 'DJ Mix Show'"
+            echo "  shokz-sync add mixcloud 'https://www.mixcloud.com/user/favorites/' 'Mixcloud'"
+            exit 1
+        fi
+        add_source "$2" "$3" "${4:-$2}"
+        ;;
+    import-opml)
+        if [ $# -lt 2 ]; then
+            echo "Usage: shokz-sync import-opml <path-to-opml-file>"
+            exit 1
+        fi
+        import_opml "$2"
+        ;;
+    *)
+        echo "Usage: shokz-sync <command>"
+        echo ""
+        echo "Commands:"
+        echo "  download     - Download new tracks from all sources"
+        echo "  sync         - Sync local library to Shokz (must be connected)"
+        echo "  auto         - Download + sync (runs on plug-in)"
+        echo "  status       - Show library, sources, and device status"
+        echo "  sources      - List configured sources"
+        echo "  add          - Add a new source (youtube, mixcloud, podcast, soundcloud)"
+        echo "  import-opml  - Import podcast subscriptions from OPML file"
+        echo ""
+        echo "Config: $SOURCES_FILE"
+        exit 1
+        ;;
+esac

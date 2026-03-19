@@ -1,0 +1,15 @@
+[Unit]
+Description=Download and sync music to Shokz OpenSwim Pro
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=%h/.local/bin/shokz-sync auto
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

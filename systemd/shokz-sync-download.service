@@ -1,0 +1,10 @@
+[Unit]
+Description=Download new tracks from configured sources
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/shokz-sync download
+StandardOutput=journal
+StandardError=journal
