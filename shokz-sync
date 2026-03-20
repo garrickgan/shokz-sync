@@ -16,6 +16,7 @@ DEVICE_LABEL="SWIM PRO"
 BROWSER="chrome"
 MAX_DEVICE_TRACKS=20
 MAX_DOWNLOADS_PER_SOURCE=50
+MAX_NEW_PER_SYNC=0
 RESERVE_MB=200
 
 # Load user config
@@ -352,10 +353,20 @@ sync_to_device() {
         return 0
     fi
 
-    log "${#to_sync[@]} new track(s) to sync"
+    local sync_limit=${#to_sync[@]}
+    if [ "$MAX_NEW_PER_SYNC" -gt 0 ] && [ "$MAX_NEW_PER_SYNC" -lt "$sync_limit" ]; then
+        log "${#to_sync[@]} new track(s) available, limiting to $MAX_NEW_PER_SYNC"
+        sync_limit=$MAX_NEW_PER_SYNC
+    else
+        log "${#to_sync[@]} new track(s) to sync"
+    fi
 
     local synced=0
     for track in "${to_sync[@]}"; do
+        if [ "$synced" -ge "$sync_limit" ]; then
+            break
+        fi
+
         local bname
         bname=$(basename "$track")
         local size
@@ -388,6 +399,11 @@ status() {
     echo "Device label: $DEVICE_LABEL"
     echo "Browser: $BROWSER"
     echo "Max device tracks: $MAX_DEVICE_TRACKS"
+    if [ "$MAX_NEW_PER_SYNC" -gt 0 ]; then
+        echo "Max new per sync: $MAX_NEW_PER_SYNC"
+    else
+        echo "Max new per sync: unlimited"
+    fi
     echo ""
 
     echo "=== Music Library ==="

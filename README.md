@@ -113,6 +113,7 @@ Config file: `~/.config/shokz-sync/config`
 | `DEVICE_LABEL` | `SWIM PRO` | USB mount label of your Shokz device |
 | `BROWSER` | `chrome` | Browser for yt-dlp cookie extraction |
 | `MAX_DEVICE_TRACKS` | `20` | Max number of tracks to keep on device |
+| `MAX_NEW_PER_SYNC` | `0` (unlimited) | Max new tracks to add per sync (0 = no limit) |
 | `MAX_DOWNLOADS_PER_SOURCE` | `50` | Max downloads per source per run |
 | `RESERVE_MB` | `200` | Reserved free space on device (MB) |
 
