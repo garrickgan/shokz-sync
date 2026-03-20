@@ -122,14 +122,24 @@ except Exception as e:
         tmpfile=$(mktemp "$LOCAL_DIR/.tmp_podcast_XXXXX")
 
         if curl -sL --max-time 600 -o "$tmpfile" "$ep_url"; then
-            # Check if it's already mp3 or needs conversion
             local mimetype
             mimetype=$(file --mime-type -b "$tmpfile")
+
             if [[ "$mimetype" == "audio/mpeg" ]]; then
                 mv "$tmpfile" "$outfile"
-            else
-                ffmpeg -y -loglevel error -i "$tmpfile" -acodec libmp3lame -q:a 0 "$outfile" 2>&1 | tee -a "$LOG_FILE" || true
+            elif [[ "$mimetype" == audio/* ]] || [[ "$mimetype" == video/* ]]; then
+                # Valid media, convert to mp3
+                if ffmpeg -y -loglevel error -i "$tmpfile" -acodec libmp3lame -q:a 0 "$outfile" 2>&1 | tee -a "$LOG_FILE"; then
+                    :
+                else
+                    log "[$label] Failed to convert: $ep_title (ffmpeg error)"
+                    rm -f "$outfile"
+                fi
                 rm -f "$tmpfile"
+            else
+                log "[$label] Skipping: $ep_title (not audio: $mimetype)"
+                rm -f "$tmpfile"
+                continue
             fi
 
             if [ -f "$outfile" ]; then
