@@ -45,6 +45,11 @@ download_ytdlp_source() {
 
     log "[$label] Downloading new tracks..."
 
+    # Snapshot existing files before download
+    local before_list
+    before_list=$(mktemp)
+    find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' -printf '%p\n' | sort > "$before_list"
+
     yt-dlp \
         --cookies-from-browser "$BROWSER" \
         --extract-audio \
@@ -58,6 +63,38 @@ download_ytdlp_source() {
         --max-downloads "$MAX_DOWNLOADS_PER_SOURCE" \
         "${extra_args[@]}" \
         "$url" 2>&1 | tee -a "$LOG_FILE" || true
+
+    # Fix timestamps: yt-dlp processes newest likes first, so they get the
+    # earliest mtime. Reverse this so newest likes have the latest mtime,
+    # which means they get prioritized when syncing to the device.
+    local after_list
+    after_list=$(mktemp)
+    find "$LOCAL_DIR" -maxdepth 1 -name '*.mp3' -printf '%p\n' | sort > "$after_list"
+
+    local -a new_files=()
+    while IFS= read -r f; do
+        new_files+=("$f")
+    done < <(comm -13 "$before_list" "$after_list")
+    rm -f "$before_list" "$after_list"
+
+    if [ ${#new_files[@]} -gt 1 ]; then
+        # Sort by mtime ascending (earliest = downloaded first = newest like)
+        local -a by_mtime=()
+        while IFS= read -r line; do
+            by_mtime+=("${line#* }")
+        done < <(for f in "${new_files[@]}"; do
+            printf '%s %s\n' "$(stat -c%Y "$f")" "$f"
+        done | sort -n)
+
+        # Touch so newest like (first downloaded) gets latest mtime
+        local now
+        now=$(date +%s)
+        local n=${#by_mtime[@]}
+        for ((i=0; i<n; i++)); do
+            touch -d "@$((now - i))" "${by_mtime[$i]}"
+        done
+        log "[$label] Reordered $n new tracks (newest likes first)"
+    fi
 }
 
 # Download from a podcast RSS feed
