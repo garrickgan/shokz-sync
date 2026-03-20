@@ -46,7 +46,7 @@ Optional:
 ## Install
 
 ```bash
-git clone https://github.com/garrickg/shokz-sync.git
+git clone https://github.com/garrickgan/shokz-sync.git
 cd shokz-sync
 ./install.sh
 ```
